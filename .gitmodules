@@ -1,0 +1,3 @@
+[submodule "aifiv"]
+	path = aifiv
+	url = git@github.com:gantech/aifiv.git

@@ -72,6 +72,10 @@ To use a winning optimizer, copy it from its run's `code/` snapshot into `aifiv/
 
 ### Run on one Polaris node (4 A100s, 4 agents)
 
+`aifiv` is a git submodule. Clone with `git clone --recurse-submodules`, or run
+`git submodule update --init` in an existing clone. The paper PDF is not tracked in `aifiv`, so
+copy it into `aifiv/` or pass `--paper`.
+
 The orchestrator runs in this repo's uv env. Training runs in the conda env that has torch and
 torch_geometric (`--train-python`). The case data `Re*/results/cylinder_2d_min.e` must be in
 `aifiv/2DLaminar` (or pass `--source`).
