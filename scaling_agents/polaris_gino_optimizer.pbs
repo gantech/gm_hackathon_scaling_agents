@@ -2,8 +2,12 @@
 # Four optimizer agents on one Polaris node, one A100 each (4_gino_optimizer_board.py):
 # per round they debate which optimizers are feasible, claim one each, train, and report back.
 #
+# Submit from the repo root (the job cds to $PBS_O_WORKDIR):
 #   qsub -A <project> scaling_agents/polaris_gino_optimizer.pbs
-#   qsub -A <project> -v TRAIN_PYTHON=$HOME/miniforge3/envs/aifiv/bin/python,ROUNDS=4 scaling_agents/polaris_gino_optimizer.pbs
+#   qsub -A <project> -v ROUNDS=4,RUNS_PER_ROUND=3 scaling_agents/polaris_gino_optimizer.pbs
+#
+# Two environments: the agents run in this repo's uv .venv (VENV); training runs through
+# polaris_train_python.sh (TRAIN_PYTHON), which loads ALCF conda + aifiv/aifiv_env (AIFIV_ENV).
 #
 # Walltime: about ROUNDS x RUNS_PER_ROUND x RUN_TIMEOUT_MIN plus debate time (3 x 2 x 60 min + ~1 h).
 #
@@ -21,13 +25,22 @@ set -euo pipefail
 cd "${PBS_O_WORKDIR:-$(dirname "$0")/..}"
 REPO=$(pwd)
 
-# Orchestrator: the uv env (academy, claude-agent-sdk) and the LLM gateway + proxy settings.
-source "${VENV:-$HOME/.venv}/bin/activate"
+# Agents: the uv env (academy, claude-agent-sdk) and the LLM gateway + proxy settings.
+VENV=${VENV:-$REPO/.venv}
+[ -d "$VENV" ] || VENV=$HOME/.venv
+source "$VENV/bin/activate"
 source "$REPO/aurora_env_setup.sh"
 
-# Trainer: the env with torch + torch_geometric that runs aifiv/2DLaminar/gino/train.py.
-TRAIN_PYTHON=${TRAIN_PYTHON:-$HOME/miniforge3/envs/aifiv/bin/python}
-"$TRAIN_PYTHON" -c "import torch; assert torch.cuda.device_count() >= 4, torch.cuda.device_count()"
+# Training: ALCF conda torch + torch_geometric, loaded only in the training subprocesses.
+TRAIN_PYTHON=${TRAIN_PYTHON:-$REPO/scaling_agents/polaris_train_python.sh}
+# Fail in seconds, not in round 1, if the training env is broken.
+"$TRAIN_PYTHON" -c "
+import torch, numpy, scipy, yaml, netCDF4
+from torch_geometric.nn import radius
+assert torch.cuda.device_count() >= 4, torch.cuda.device_count()
+x = torch.rand(100, 2, device='cuda')
+print('training env OK:', torch.__version__, torch.version.cuda, torch.cuda.device_count(), 'GPUs', radius(x, x, 0.1).shape)
+"
 
 nvidia-smi topo -m || true
 

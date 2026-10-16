@@ -76,12 +76,47 @@ To use a winning optimizer, copy it from its run's `code/` snapshot into `aifiv/
 `git submodule update --init` in an existing clone. The paper PDF is not tracked in `aifiv`, so
 copy it into `aifiv/` or pass `--paper`.
 
-The orchestrator runs in this repo's uv env. Training runs in the conda env that has torch and
-torch_geometric (`--train-python`). The case data `Re*/results/cylinder_2d_min.e` must be in
-`aifiv/2DLaminar` (or pass `--source`).
+The agents and the training use two separate Python environments:
+
+| Env | Runs | Set up with |
+|---|---|---|
+| `.venv` (uv, Python 3.13) | the agents: Academy, the Claude Agent SDK, the message board | `uv sync` in this repo |
+| `aifiv/aifiv_env` on ALCF conda base | `train.py`, `evaluate.py`, `gino_profile.py` | see below |
+
+The training env is a venv on top of ALCF's conda base, so it keeps ALCF's optimized torch and
+adds only PyG. The code uses PyG's `scatter` with sum and mean, which run on torch's native
+`scatter_add_`. It also uses `radius`. So `torch_scatter`, `torch_sparse` and `pyg_lib` are not
+needed. Run these from the repo root on a login node:
 
 ```bash
-qsub -A <project> -v TRAIN_PYTHON=$HOME/miniforge3/envs/aifiv/bin/python scaling_agents/polaris_gino_optimizer.pbs
+module use /soft/modulefiles; module load conda; conda activate base
+```
+
+```bash
+python -m venv --system-site-packages aifiv/aifiv_env
+```
+
+```bash
+source aifiv/aifiv_env/bin/activate && pip install torch_geometric
+```
+
+Keep the venv out of the aifiv repo:
+
+```bash
+cd aifiv && echo aifiv_env/ >> "$(git rev-parse --git-path info/exclude)" && cd ..
+```
+
+The agents never load conda. Each training run goes through
+`scaling_agents/polaris_train_python.sh` (the default `TRAIN_PYTHON`), which loads the conda
+module and activates `aifiv_env` for that subprocess only. Set `AIFIV_ENV` to use a venv
+somewhere else. Before starting the agents, the job checks the training env: torch, PyG
+`radius` on a GPU, netCDF4, and 4 visible GPUs. A broken env fails in seconds, not in round 1.
+
+The case data `Re*/results/cylinder_2d_min.e` must be in `aifiv/2DLaminar` (or pass `--source`).
+Put your AMSC token in `aurora_env_setup.sh`. Submit from the repo root:
+
+```bash
+qsub -A <project> scaling_agents/polaris_gino_optimizer.pbs
 ```
 
 The script uses environment variables for the main settings: `FIXED_ARGS` (default
