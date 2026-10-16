@@ -1,0 +1,41 @@
+#!/bin/bash -l
+# Four optimizer agents on one Polaris node, one A100 each (4_gino_optimizer_board.py):
+# per round they debate which optimizers are feasible, claim one each, train, and report back.
+#
+#   qsub -A <project> scaling_agents/polaris_gino_optimizer.pbs
+#   qsub -A <project> -v TRAIN_PYTHON=$HOME/miniforge3/envs/aifiv/bin/python,ROUNDS=4 scaling_agents/polaris_gino_optimizer.pbs
+#
+# Walltime: about ROUNDS x RUNS_PER_ROUND x RUN_TIMEOUT_MIN plus debate time (3 x 2 x 60 min + ~1 h).
+#
+# Or interactively: qsub -I -A <project> -q debug -l select=1 -l walltime=01:00:00 -l filesystems=home:eagle,
+# then run the commands below by hand.
+#PBS -N gino_optimizer
+#PBS -l select=1:system=polaris
+#PBS -l place=scatter
+#PBS -l walltime=08:00:00
+#PBS -l filesystems=home:eagle
+#PBS -q preemptable
+#PBS -j oe
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR:-$(dirname "$0")/..}"
+REPO=$(pwd)
+
+# Orchestrator: the uv env (academy, claude-agent-sdk) and the LLM gateway + proxy settings.
+source "${VENV:-$HOME/.venv}/bin/activate"
+source "$REPO/aurora_env_setup.sh"
+
+# Trainer: the env with torch + torch_geometric that runs aifiv/2DLaminar/gino/train.py.
+TRAIN_PYTHON=${TRAIN_PYTHON:-$HOME/miniforge3/envs/aifiv/bin/python}
+"$TRAIN_PYTHON" -c "import torch; assert torch.cuda.device_count() >= 4, torch.cuda.device_count()"
+
+nvidia-smi topo -m || true
+
+python scaling_agents/4_gino_optimizer_board.py \
+    --gpus 0 1 2 3 \
+    --train-python "$TRAIN_PYTHON" \
+    --fixed-args "${FIXED_ARGS:---epochs 2000 --warmup-epochs 200 --ramp-epochs 800}" \
+    --rounds "${ROUNDS:-3}" \
+    --runs-per-round "${RUNS_PER_ROUND:-2}" \
+    --run-timeout-min "${RUN_TIMEOUT_MIN:-60}" \
+    ${CAMPAIGN:+--campaign "$CAMPAIGN"}

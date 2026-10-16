@@ -16,6 +16,7 @@ dependencies = [
     "rdkit>=2026.9.1",
     "parsl>=2026.10.5",
     "claude-agent-sdk>=0.2.165",
+    "pymupdf>=1.26",
 ]
 
 [build-system]

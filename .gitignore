@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# GINO optimizer agent campaigns (scaling_agents/4_gino_optimizer_board.py)
+runs/
