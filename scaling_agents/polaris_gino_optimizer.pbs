@@ -11,7 +11,11 @@
 # The agents use GINO_LLM_MODEL (default claude-opus-5-5), falling back to GINO_LLM_FALLBACK_MODEL
 # (default claude-sonnet-5-5) when it is overloaded.
 #
-# Walltime: about ROUNDS x RUNS_PER_ROUND x RUN_TIMEOUT_MIN plus debate time (3 x 2 x 60 min + ~1 h).
+# Walltime: keep WALLTIME_MIN equal to the -l walltime below. The agents see the time left, runs are
+# cut 12 min before the end so every agent can score and report, and no round starts with < 40 min.
+#
+# Prior knowledge: scaling_agents/gino_prior (briefing, earlier boards, the Kestrel log) plus every
+# earlier campaign directory in runs/ (the agents may read their code). Set PRIOR to override.
 #
 # Or interactively: qsub -I -A <project> -q debug -l select=1 -l walltime=01:00:00 -l filesystems=home:eagle,
 # then run the commands below by hand.
@@ -50,7 +54,9 @@ python scaling_agents/4_gino_optimizer_board.py \
     --gpus 0 1 2 3 \
     --train-python "$TRAIN_PYTHON" \
     --fixed-args "${FIXED_ARGS:---epochs 2000 --warmup-epochs 200 --ramp-epochs 800}" \
-    --rounds "${ROUNDS:-3}" \
-    --runs-per-round "${RUNS_PER_ROUND:-2}" \
-    --run-timeout-min "${RUN_TIMEOUT_MIN:-60}" \
+    --rounds "${ROUNDS:-5}" \
+    --runs-per-round "${RUNS_PER_ROUND:-4}" \
+    --run-timeout-min "${RUN_TIMEOUT_MIN:-25}" \
+    --walltime-min $(( ${WALLTIME_MIN:-480} - SECONDS / 60 )) \
+    --prior ${PRIOR:-scaling_agents/gino_prior $(ls -d runs/gino_optimizer_* 2> /dev/null)} \
     ${CAMPAIGN:+--campaign "$CAMPAIGN"}

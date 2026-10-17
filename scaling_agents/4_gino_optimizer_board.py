@@ -32,6 +32,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 import sys
 import time
@@ -60,6 +61,9 @@ from gino_runner import GpuRunner
 logger = logging.getLogger(__name__)
 
 REPO = Path(__file__).resolve().parent.parent
+PRIOR = Path(__file__).resolve().parent / 'gino_prior'
+# A round needs at least this long (debate plus one short run) to be worth starting.
+MIN_ROUND_MIN = 40.0
 FILE_TOOLS = ['Read', 'Write', 'Edit', 'Glob', 'Grep']
 WRITE_TOOLS = {'Write', 'Edit'}
 DEBATE_STEPS = ('propose', 'critique', 'claim')
@@ -77,11 +81,13 @@ CLI_ENV = {
 }
 
 STEP_PROMPTS = {
-    'propose': """ROUND {round} DEBATE, step 1 of 3: PROPOSE.
-Read the board (leaderboard, previous round reports), and as needed the paper and the training code.
-Propose 1-3 optimization strategies worth trying THIS round. Draw on the paper (Adam then L-BFGS, SOAP,
-SS-Broyden) or anything else you know (Shampoo, Muon, natural-gradient / Gauss-Newton, limited-memory
-quasi-Newton variants, LR schedules, phase switching, ...). For each one give:
+    'propose': """ROUND {round} DEBATE, step 1 of 3: PROPOSE. ({clock})
+Read the board (leaderboard, previous round reports), the BRIEFING on earlier campaigns, and as needed
+the papers, the prior-campaign files and the training code. Build on what is already known rather than
+re-deriving it. Propose 1-3 optimization strategies worth trying THIS round. Draw on the papers (Adam
+then L-BFGS, SOAP, SS-Broyden; DSGNAR, the doubly-sketched Gauss-Newton with adaptive ratio) or anything
+else you know (Shampoo, Muon, natural-gradient / Gauss-Newton, limited-memory quasi-Newton variants,
+LR schedules, phase switching, ...). For each one give:
   - what it is, and how it would plug into train.py;
   - feasibility for THIS model, with arithmetic from MODEL FACTS: optimizer state size against GPU
     memory, extra cost per step against the epoch time, whether it needs full-batch / line searches,
@@ -89,22 +95,24 @@ quasi-Newton variants, LR schedules, phase switching, ...). For each one give:
     example a dense N x N curvature matrix);
   - expected benefit, and the concrete runs that would test it within {runs} full runs.
 Your final message is posted to the board as your proposal.""",
-    'critique': """ROUND {round} DEBATE, step 2 of 3: CRITIQUE.
+    'critique': """ROUND {round} DEBATE, step 2 of 3: CRITIQUE. ({clock})
 Read every proposal on the board for this round. Check your peers' feasibility arithmetic and
 claims: point out errors, infeasible or redundant items, and better variants (for instance a
 limited-memory or block-diagonal version of something infeasible). Then rank the directions the
 team should run this round (one per agent) and say why.
 Your final message is posted to the board as your critique.""",
-    'claim': """ROUND {round} DEBATE, step 3 of 3: CLAIM.
+    'claim': """ROUND {round} DEBATE, step 3 of 3: CLAIM. ({clock})
 Read the critiques and the claims your peers have already posted this round (agents claim in
 order agent0, agent1, ...). Claim ONE direction that nobody has claimed this round, preferring the
 team's ranking. State exactly what you will implement, the files and flags you will add, and the
 {runs} full runs you plan. Keep it under 150 words. Your final message is posted as your claim.""",
-    'work': """ROUND {round} WORK.
+    'work': """ROUND {round} WORK. ({clock})
 Carry out your claim: implement it in your workspace, check it with `smoke_test` (and `run_script`
 for standalone tests), then use your {runs} full runs (launch_training, then wait_for_job until it
 finishes). Post insights with write_board as you learn things. If the claim turns out infeasible
 or broken, post an insight saying why and switch to the next-best unclaimed direction.
+Runs are cut at the job deadline, and launches are refused in its last minutes, so leave time to
+finish and report.
 Finish with your ROUND REPORT, which is posted automatically: what you implemented (files, flags),
 each run_id with test_rel_l2 and wall time against the baseline, what you learned, and what the
 team should try next round.""",
@@ -116,8 +124,11 @@ def text_result(payload: Any) -> dict[str, Any]:
     return {'content': [{'type': 'text', 'text': text}]}
 
 
-def extract_paper(pdf: Path, dest: Path) -> Path:
-    """Plain text of the paper for models that cannot read PDFs; falls back to the PDF."""
+def extract_paper(pdf: Path, dest: Path) -> Path | None:
+    """Plain text of a paper for models that cannot read PDFs; falls back to the PDF."""
+    if not pdf.exists():
+        logger.warning(f'paper {pdf} not found; the agents will not see it')
+        return None
     if pdf.suffix.lower() != '.pdf':
         return pdf
     try:
@@ -130,6 +141,36 @@ def extract_paper(pdf: Path, dest: Path) -> Path:
     return dest
 
 
+def load_prior_results(paths: list[Path]) -> list[dict[str, Any]]:
+    """Full-run results from earlier campaigns' boards, as board posts for the leaderboard.
+
+    Accepts board*.jsonl files, campaign directories, and directories of campaigns. A campaign is
+    labelled by the timestamp in its path, so the same campaign given twice is loaded once.
+    """
+    boards: list[Path] = []
+    for path in paths:
+        if path.is_file():
+            boards.append(path)
+        elif path.is_dir():
+            boards += sorted(path.glob('board*.jsonl')) + sorted(path.glob('*/board.jsonl'))
+    posts: dict[tuple[str, str], dict[str, Any]] = {}
+    for board in boards:
+        if not board.name.startswith('board') or board.suffix != '.jsonl':
+            continue
+        stamp = re.search(r'\d{8}_\d{6}', str(board))
+        label = stamp.group(0) if stamp else board.stem
+        for line in board.read_text().splitlines():
+            post = json.loads(line)
+            result = post.get('result') or {}
+            if post.get('kind') != 'result' or result.get('kind') != 'full':
+                continue
+            posts[label, result['run_id']] = {
+                'time': post.get('time', ''), 'round': 0, 'author': f'prior {label}',
+                'kind': 'result', 'result': {**result, 'campaign': label},
+            }
+    return list(posts.values())
+
+
 class OptimizerAgent(Agent):
     """An LLM agent that debates and tests optimizers for the GINO model on one GPU.
 
@@ -138,7 +179,8 @@ class OptimizerAgent(Agent):
         index: This agent's index; also picks its GPU from ``gpus``.
         gpus: GPU ids, one per agent.
         setup: Shared paths, training budget and scoring case.
-        paper: Path to the optimizer paper (text or PDF).
+        knowledge: Papers (text or PDF paths), prior-campaign paths the agent may read, the
+            briefing text, and prior full-run results (board posts) for the leaderboard.
         runs_per_round: Full training runs this agent may launch per round.
     """
 
@@ -148,7 +190,7 @@ class OptimizerAgent(Agent):
         index: int,
         gpus: list[int],
         setup: GinoSetup,
-        paper: Path,
+        knowledge: dict[str, Any],
         runs_per_round: int,
     ) -> None:
         self.model = MODEL
@@ -158,11 +200,13 @@ class OptimizerAgent(Agent):
         self.gpu = gpus[index]
         self.num_agents = len(gpus)
         self.setup = setup
-        self.paper = paper
+        self.papers: list[Path] = knowledge['papers']
+        self.prior_paths: list[Path] = knowledge['prior_paths']
+        self.briefing: str = knowledge['briefing']
         self.runs_per_round = runs_per_round
         self.workspace = setup.campaign / self.name
         self.runner = GpuRunner(setup, self.name, self.gpu, self.workspace)
-        self.posts: list[dict[str, Any]] = []
+        self.posts: list[dict[str, Any]] = list(knowledge['prior_results'])
         self.facts: dict[str, Any] = {}
         self.round = 0
         self.phase = 'idle'
@@ -237,7 +281,7 @@ class OptimizerAgent(Agent):
         return path == root or root in path.parents
 
     async def can_use_tool(self, tool_name: str, tool_input: dict[str, Any], context: Any):
-        """Reads anywhere in the campaign + the paper; writes only in this agent's workspace, only while working."""
+        """Reads in the campaign, the papers and prior campaigns; writes only in this agent's workspace, while working."""
         if tool_name not in FILE_TOOLS:
             return PermissionResultDeny(message=f'{tool_name} is not available; use the gino tools')
         pattern = str(tool_input.get('pattern', ''))
@@ -255,8 +299,9 @@ class OptimizerAgent(Agent):
             ok = self._inside(path, root) and 'runs' not in path.relative_to(root).parts
             where = f'your workspace {self.workspace}'
         else:
-            ok = self._inside(path, self.setup.campaign.resolve()) or path == self.paper.resolve()
-            where = f'the campaign directory {self.setup.campaign} or the paper'
+            roots = [self.setup.campaign, *self.papers, *self.prior_paths]
+            ok = any(self._inside(path, root.resolve()) for root in roots)
+            where = f'the campaign directory {self.setup.campaign}, the papers or the prior-campaign files'
         if ok:
             return PermissionResultAllow()
         return PermissionResultDeny(message=f'{tool_name} on {path} denied: only {where} is allowed')
@@ -265,6 +310,8 @@ class OptimizerAgent(Agent):
 
     def _system_prompt(self) -> str:
         setup = self.setup
+        papers = '\n'.join(f'- {p}' for p in self.papers) or '- (none found)'
+        priors = '\n'.join(f'- {p}' for p in self.prior_paths) or '- (none)'
         return f"""You are {self.name}, one of {self.num_agents} peer research agents on one GPU node, each with
 its own GPU (yours is GPU {self.gpu}). Together you are improving the OPTIMIZER used to train a GINO
 (graph-informed neural operator: GNO encoder, FNO on overset latent grids, GNO decoder) surrogate for
@@ -272,10 +319,21 @@ its own GPU (yours is GPU {self.gpu}). Together you are improving the OPTIMIZER 
 physics-residual loss.
 
 Current training: Adam with cosine LR decay, a physics-loss warm-up and ramp with gradient balancing,
-and an optional full-batch L-BFGS phase (--lbfgs-blocks). The paper at {self.paper} reports that
-quasi-second-order (SOAP) and second-order (SS-Broyden) optimizers reach far lower errors than Adam on
-physics-informed objectives, on the paper's own networks (compare their sizes with MODEL FACTS).
-Whether any of it is feasible or worth it here is for the team to work out. A well-explained negative result is also valuable.
+and an optional full-batch L-BFGS phase (--lbfgs-blocks).
+
+Papers (read them; text extracts where available):
+{papers}
+They report that quasi-second-order (SOAP), second-order (SS-Broyden) and sketched Gauss-Newton
+(DSGNAR) optimizers reach far lower errors than Adam on physics-informed objectives, on the papers' own
+networks (compare their sizes with MODEL FACTS). Whether any of it is feasible here as published, or
+can be adapted, is for the team to work out. A well-explained negative result is also valuable.
+
+Earlier campaigns already tested several ideas on this exact setup. Their scored full runs are on
+the leaderboard (marked with "campaign"); their full boards, logs and code are in:
+{priors}
+
+BRIEFING from the earlier campaigns (start from here):
+{self.briefing}
 
 You work in rounds: debate (propose, critique, claim), then work (implement, train, report).
 
@@ -319,6 +377,8 @@ Results of every run are posted to the board automatically."""
             await self._post_finished()
             if kind == 'full' and self.runs_left <= 0:
                 return text_result('No full runs left this round. Write your round report.')
+            if self.setup.minutes_left() < 8:
+                return text_result('The job deadline is minutes away: no more launches. Write your round report.')
             try:
                 record = runner.launch(kind, shlex.split(args.get('extra_args') or args.get('args') or ''),
                                        args.get('notes', ''), script=script)
@@ -386,6 +446,10 @@ Results of every run are posted to the board automatically."""
 
         return [read_board, write_board, launch_training, smoke_test, run_script, wait_for_job]
 
+    def _clock(self) -> str:
+        left = self.setup.minutes_left()
+        return 'no job deadline' if left == float('inf') else f'{left:.0f} minutes of job time left'
+
     async def _converse(self, prompt: str, max_turns: int) -> str:
         """One phase of this agent's conversation, resumed from the previous phase."""
         tools = self._tools()
@@ -443,7 +507,7 @@ Results of every run are posted to the board automatically."""
         """One debate step; the agent's final message is posted as a proposal, critique or claim."""
         self.round, self.phase = round_, step
         text = await self._converse(
-            STEP_PROMPTS[step].format(round=round_, runs=self.runs_per_round), max_turns=40,
+            STEP_PROMPTS[step].format(round=round_, runs=self.runs_per_round, clock=self._clock()), max_turns=40,
         )
         await self._publish({'kind': step, 'text': text})
         self.phase = 'idle'
@@ -455,7 +519,7 @@ Results of every run are posted to the board automatically."""
         self.round, self.phase = round_, 'work'
         self.runs_left = self.runs_per_round
         text = await self._converse(
-            STEP_PROMPTS['work'].format(round=round_, runs=self.runs_per_round), max_turns=300,
+            STEP_PROMPTS['work'].format(round=round_, runs=self.runs_per_round, clock=self._clock()), max_turns=300,
         )
         if self.runner.busy and self.runner.records[-1].kind == 'full':
             # The conversation ended with a run still going: let it finish so the next round sees it.
@@ -471,7 +535,19 @@ def parse_cli() -> argparse.Namespace:
     parser.add_argument('--gpus', type=int, nargs='+', default=[0, 1, 2, 3], help='One agent per GPU')
     parser.add_argument('--source', type=Path, default=REPO / 'aifiv' / '2DLaminar',
                         help='Directory with gino/, pino_physics_loss.py and the Re* case data')
-    parser.add_argument('--paper', type=Path, default=REPO / 'aifiv' / '1-s2.0-S0045782526004299-main.pdf')
+    parser.add_argument('--paper', type=Path, nargs='+', default=[
+        REPO / 'aifiv' / '1-s2.0-S0045782526004299-main.pdf',  # spectral bias: SOAP, SS-Broyden
+        REPO / 'aifiv' / '2607.02194v1.pdf',                    # DSGNAR: doubly-sketched Gauss-Newton
+    ], help='Papers for the agents (PDF or text); missing ones are skipped with a warning')
+    parser.add_argument('--prior', type=Path, nargs='*', default=[PRIOR],
+                        help='Earlier campaigns the agents may read: board*.jsonl files, logs, campaign '
+                             'directories (e.g. runs/gino_optimizer_*). Their scored runs join the leaderboard')
+    parser.add_argument('--briefing', type=Path, default=PRIOR / 'briefing.md',
+                        help='What earlier campaigns found; part of every agent\'s system prompt')
+    parser.add_argument('--walltime-min', type=float, default=None,
+                        help='Job walltime: runs are cut and no new round starts near its end')
+    parser.add_argument('--end-margin-min', type=float, default=12.0,
+                        help='Stop all jobs this long before the walltime, to score and report')
     parser.add_argument('--campaign', type=Path, default=None,
                         help='Output directory (default: runs/gino_optimizer_<timestamp>); reuse to keep workspaces')
     parser.add_argument('--train-python', default=sys.executable,
@@ -505,6 +581,7 @@ async def run_phase(label: str, calls: list[Any]) -> list[Any]:
 
 
 async def main() -> None:
+    start = time.time()
     cli = parse_cli()
     campaign = (cli.campaign or REPO / 'runs' / time.strftime('gino_optimizer_%Y%m%d_%H%M%S')).resolve()
     campaign.mkdir(parents=True, exist_ok=True)
@@ -516,11 +593,25 @@ async def main() -> None:
         eval_re=cli.eval_re,
         run_timeout_min=cli.run_timeout_min,
         cpu_bind=cli.cpu_bind,
+        deadline=None if cli.walltime_min is None else start + 60.0 * (cli.walltime_min - cli.end_margin_min),
     )
     setup.prepare(len(cli.gpus))
-    paper = extract_paper(cli.paper.resolve(), campaign / 'reference' / 'paper.txt')
+    papers = [
+        extract_paper(pdf.resolve(), campaign / 'reference' / f'{pdf.stem}.txt') for pdf in cli.paper
+    ]
+    prior_paths = [p.resolve() for p in cli.prior if p.exists()]
+    for missing in sorted(set(cli.prior) - {p for p in cli.prior if p.exists()}):
+        logger.warning(f'prior {missing} not found; skipped')
+    briefing = cli.briefing.read_text() if cli.briefing.exists() else '(no briefing)'
+    knowledge = {
+        'papers': [p for p in papers if p is not None],
+        'prior_paths': prior_paths,
+        'briefing': briefing,
+        'prior_results': load_prior_results(prior_paths),
+    }
     logger.info(f'Campaign {campaign}: {len(cli.gpus)} agents on GPUs {cli.gpus}, {cli.rounds} rounds, '
-                f'model {MODEL} (fallback {FALLBACK_MODEL or "none"})')
+                f'model {MODEL} (fallback {FALLBACK_MODEL or "none"}), {len(knowledge["papers"])} papers, '
+                f'{len(knowledge["prior_results"])} prior runs, {setup.minutes_left():.0f} min of job time')
 
     async with await Manager.from_exchange_factory(
         factory=LocalExchangeFactory(),
@@ -533,7 +624,7 @@ async def main() -> None:
         handles = [
             await manager.launch(
                 OptimizerAgent,
-                args=(peers, i, cli.gpus, setup, paper, cli.runs_per_round),
+                args=(peers, i, cli.gpus, setup, knowledge, cli.runs_per_round),
                 registration=reg,
             )
             for i, reg in enumerate(registrations)
@@ -547,6 +638,9 @@ async def main() -> None:
             logger.info(f'Started baseline {await handles[0].start_baseline()}')
 
         for round_ in range(1, cli.rounds + 1):
+            if setup.minutes_left() < MIN_ROUND_MIN:
+                logger.info(f'Stopping before round {round_}: {setup.minutes_left():.0f} min of job time left')
+                break
             for step in DEBATE_STEPS:
                 logger.info(f'Round {round_}: {step}')
                 if step == 'claim':  # in order, so each agent sees the claims before it

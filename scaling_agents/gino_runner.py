@@ -138,10 +138,18 @@ class GinoSetup:
     run_timeout_min: float
     smoke_timeout_min: float = 10.0
     cpu_bind: str = 'polaris'
+    deadline: float | None = None   # time.time() by which every job must have ended (job walltime)
 
     @property
     def reference(self) -> Path:
         return self.campaign / 'reference'
+
+    def minutes_left(self) -> float:
+        return math.inf if self.deadline is None else (self.deadline - time.time()) / 60.0
+
+    def cap(self, timeout_min: float) -> float:
+        """A job timeout that also ends before the deadline (at least 1 minute)."""
+        return max(1.0, min(timeout_min, self.minutes_left()))
 
     def prepare(self, num_agents: int) -> list[Path]:
         if not (self.reference / 'gino').exists():
@@ -269,7 +277,7 @@ class GpuRunner:
             snapshot_code(self.workspace, run_dir / 'code')
             if record.kind == 'script':
                 cmd = [setup.train_python, script, *record.extra_args]
-                rc, timed_out = await self._run(cmd, run_dir / 'script.log', gino, setup.smoke_timeout_min)
+                rc, timed_out = await self._run(cmd, run_dir / 'script.log', gino, setup.cap(setup.smoke_timeout_min))
                 record.returncode = rc
                 record.status = 'timeout' if timed_out else ('finished' if rc == 0 else 'failed')
                 record.error_tail = self._tail(run_dir / 'script.log', 60)
@@ -283,7 +291,7 @@ class GpuRunner:
                 '--data-root', str(setup.source), '--device', 'cuda',
                 '--output-dir', str(run_dir), *budget,
             ]
-            timeout = setup.smoke_timeout_min if record.kind == 'smoke' else setup.run_timeout_min
+            timeout = setup.cap(setup.smoke_timeout_min if record.kind == 'smoke' else setup.run_timeout_min)
             rc, timed_out = await self._run(cmd, run_dir / 'train.log', gino, timeout)
             record.returncode = rc
             log_text = (run_dir / 'train.log').read_text(errors='replace')
@@ -310,7 +318,8 @@ class GpuRunner:
             '--case-dir', str(setup.source / f'Re{setup.eval_re}'), '--device', 'cuda',
             '--output', str(run_dir / 'prediction.npz'),
         ]
-        await self._run(cmd, run_dir / 'eval.log', setup.reference / 'gino', setup.smoke_timeout_min)
+        # Scoring gets its own few minutes even when the run itself was cut at the deadline.
+        await self._run(cmd, run_dir / 'eval.log', setup.reference / 'gino', 5.0)
         return parse_eval_log((run_dir / 'eval.log').read_text(errors='replace'))
 
     async def profile(self) -> dict[str, Any]:

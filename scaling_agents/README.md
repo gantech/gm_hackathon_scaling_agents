@@ -70,6 +70,27 @@ Outputs go in `runs/gino_optimizer_<timestamp>/`:
 
 To use a winning optimizer, copy it from its run's `code/` snapshot into `aifiv/2DLaminar/gino`.
 
+### Starting from earlier campaigns
+
+A new campaign doesn't start from scratch. `--prior` gives the agents earlier results to read.
+`scaling_agents/gino_prior/` holds:
+- `briefing.md`: what earlier campaigns found, the feasibility arithmetic, notes on the DSGNAR paper,
+  and suggestions. It's part of every agent's system prompt.
+- `board_*.jsonl`: the earlier campaigns' boards.
+- `kestrel_adam_10000_epochs.log`: a 10,000-epoch Adam run.
+
+Every scored full run in a prior board joins the leaderboard, marked with its campaign. The agents
+can also read prior campaign directories, for example `runs/gino_optimizer_*`, to reuse earlier
+agents' code (such as `soap.py`). The PBS script passes `gino_prior` plus every campaign it finds in
+`runs/`.
+
+The papers are passed with `--paper`. The defaults are the spectral-bias paper (SOAP, SS-Broyden) and
+`2607.02194v1.pdf` (DSGNAR, a doubly-sketched Gauss–Newton method), both in `aifiv/`. Neither PDF is in
+git, so copy them there. A missing paper is skipped with a warning.
+
+After a campaign, update `briefing.md` and copy its `board.jsonl` into `gino_prior/`, so the next
+campaign starts from what this one learned.
+
 ### Run on one Polaris node (4 A100s, 4 agents)
 
 `aifiv` is a git submodule. Clone with `git clone --recurse-submodules`, or run
@@ -123,10 +144,18 @@ Submit from the repo root:
 qsub -A <project> scaling_agents/polaris_gino_optimizer.pbs
 ```
 
-The script uses environment variables for the main settings: `FIXED_ARGS` (default
-`--epochs 2000 --warmup-epochs 200 --ramp-epochs 800`), `ROUNDS` (default 3), `RUNS_PER_ROUND`
-(default 2), `RUN_TIMEOUT_MIN` (default 60) and `CAMPAIGN` (pass an existing campaign directory to
-reuse its workspaces). The walltime needs to cover about ROUNDS x RUNS_PER_ROUND x RUN_TIMEOUT_MIN,
-plus the debates. The defaults need about 7 hours, and the script requests 8. Each
+The script uses environment variables for the main settings:
+- `FIXED_ARGS`: default `--epochs 2000 --warmup-epochs 200 --ramp-epochs 800`.
+- `ROUNDS`: default 5.
+- `RUNS_PER_ROUND`: default 4.
+- `RUN_TIMEOUT_MIN`: default 25.
+- `WALLTIME_MIN`: default 480. Keep it equal to the `-l walltime` you request.
+- `PRIOR`: the prior-knowledge paths.
+- `CAMPAIGN`: an existing campaign directory, to reuse its workspaces.
+
+The agents see how much job time is left. Every run is cut 12 minutes before the walltime, so each
+agent can score its run and post a report. Launches are refused in the last minutes, and no new
+round starts with less than 40 minutes left. Within an 8-hour job, the round count adapts to how long
+each round takes. Each
 run is pinned to its GPU with `CUDA_VISIBLE_DEVICES` and to the 8 cores next to that GPU
 (`--cpu-bind polaris`). Check the core mapping with `nvidia-smi topo -m`.
