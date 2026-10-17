@@ -3,7 +3,7 @@
 # each running up to 4 trainings at once, one per A100. Per round they debate which optimizers are
 # feasible, claim one direction each, train, and report back.
 #
-# Submit from the repo root (the job cds to $PBS_O_WORKDIR):
+# Submit from anywhere inside the checkout (the job finds the repo root itself):
 #   qsub -A <project> scaling_agents/polaris_gino_optimizer.pbs
 #   qsub -A <project> -v ROUNDS=4,RUNS_PER_ROUND=12 scaling_agents/polaris_gino_optimizer.pbs
 #
@@ -30,15 +30,35 @@
 #PBS -j oe
 
 set -euo pipefail
-cd "${PBS_O_WORKDIR:-$(dirname "$0")/..}"
-REPO=$(pwd)
+
+# The repo root, from wherever qsub was run inside the checkout. PBS runs a spooled copy of this
+# script, so $0 can't locate it; walk up from the submit directory instead.
+find_repo() {
+    local dir=$1
+    while [ "$dir" != / ]; do
+        [ -f "$dir/scaling_agents/4_gino_optimizer_board.py" ] && { echo "$dir"; return 0; }
+        dir=$(dirname "$dir")
+    done
+    return 1
+}
+REPO=${REPO:-$(find_repo "${PBS_O_WORKDIR:-$PWD}")} || {
+    echo "error: qsub was run in ${PBS_O_WORKDIR:-$PWD}, outside the gm_hackathon_scaling_agents" \
+         "checkout; submit from inside it or pass -v REPO=<checkout>" >&2
+    exit 1
+}
+cd "$REPO"
+echo "repo: $REPO"
 HOSTS=$(sort -u "$PBS_NODEFILE")
-NNODES=$(wc -l <<< "$HOSTS")
+NNODES=$(grep -c . <<< "$HOSTS")
 echo "nodes ($NNODES): $(echo $HOSTS)"
 
 # Agents: the uv env (academy, claude-agent-sdk) and the LLM gateway + proxy settings.
 VENV=${VENV:-$REPO/.venv}
-[ -d "$VENV" ] || VENV=$HOME/.venv
+[ -f "$VENV/bin/activate" ] || VENV=$HOME/.venv
+[ -f "$VENV/bin/activate" ] || {
+    echo "error: no uv env in $REPO/.venv or $HOME/.venv; run 'uv sync' in $REPO, or pass -v VENV=<env>" >&2
+    exit 1
+}
 source "$VENV/bin/activate"
 source "$REPO/aurora_env_setup.sh"
 

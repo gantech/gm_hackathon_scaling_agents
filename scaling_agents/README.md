@@ -149,13 +149,15 @@ Put your AMSC token in `aurora_env_setup.sh`. The agents use `claude-opus-5-5`, 
 `claude-sonnet-5-5` when Opus is overloaded. MAG serves both under the `google` provider header that
 `aurora_env_setup.sh` already sets. Override them with `GINO_LLM_MODEL` and
 `GINO_LLM_FALLBACK_MODEL`. These are separate from `LLM_MODEL`, which the Wordle examples use.
-Submit from the repo root. The script asks for 5 nodes in `prod` (its minimum) for 8 hours:
+Submit from anywhere inside the checkout; the job finds the repo root itself. The script asks for
+5 nodes in `prod` for 8 hours. Override the node count when you submit, since `prod`'s minimum may
+be higher (here, 10):
 
 ```bash
-qsub -A <project> scaling_agents/polaris_gino_optimizer.pbs
+qsub -A <project> -l select=10:system=polaris scaling_agents/polaris_gino_optimizer.pbs
 ```
 
-To change the number of agents, change `-l select`: there is always one agent per node.
+There is always one agent per node, so `-l select` sets the number of agents.
 
 The script uses environment variables for the main settings:
 - `FIXED_ARGS`: default `--epochs 2000 --warmup-epochs 200 --ramp-epochs 800`.
