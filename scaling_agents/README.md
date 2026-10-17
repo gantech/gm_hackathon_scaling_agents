@@ -18,7 +18,7 @@ Each script runs Wordle agents. The agents use the Claude Agent SDK, and Academy
 | `1_independent.py` | **Independent.** Each agent plays alone. | 2 `WordleAgent` |
 | `2_message_board.py` | **Peers.** The agents share what they learn on a blackboard. | 2 `WordleAgent` |
 | `3_multi_strategy.py` | **Coordinator and sub-agents.** The sub-agents test strategies on a cheap simulator. Then the coordinator plays the real game one time with the best strategy. | 1 `CoordinatorAgent` and 3 `StrategyAgent` |
-| `4_gino_optimizer_board.py` | **Debate, then work, in rounds.** For the GINO model in `aifiv/2DLaminar`, the agents debate which optimizers are feasible and worth trying, and each claims one. Each agent implements its claim in its own copy of the code, trains it on its own GPU, and reports back on a message board. Then the next round starts. | 1 `OptimizerAgent` per GPU |
+| `4_gino_optimizer_board.py` | **Debate, then work, in rounds.** For the GINO model in `aifiv/2DLaminar`, the agents debate which optimizers are feasible and worth trying, and each claims one. Each agent implements its claim in its own copy of the code, trains it on its own node (up to 4 runs at once), and reports back on a message board. Then the next round starts. | 1 `OptimizerAgent` per node (or per GPU on one node) |
 
 At the end, each script shows the answer from each agent and the true target word.
 
@@ -30,9 +30,16 @@ This is the message-board pattern of `2_message_board.py` applied to training th
 surrogate in `aifiv/2DLaminar/gino`. The paper in `aifiv/` reports that SOAP, SS-Broyden, and
 Adam followed by L-BFGS beat plain Adam on physics-informed problems. The agents decide
 for themselves which of these, or other optimizers, are feasible and worth implementing for this
-model. Then they test them.
+model. Then they test them. They may also shrink or grow the model through `train.py`'s existing
+architecture flags, such as `--latent-channels` and `--num-fno-layers`.
 
-Before round 1, the harness measures the original model on GPU 0 with `gino_profile.py`. It records
+Agents equal nodes. With `--hosts` (the PBS script passes every node of the job), each agent gets one
+node and runs up to one training job per GPU there, so an agent can run an LR sweep on 4 GPUs at once.
+All agents and their LLM calls run in one process on the first node. Each training job is started on
+its agent's node with `mpiexec -n 1 --hosts <node>`: mpiexec is only the launcher, and nothing uses
+MPI. Without `--hosts`, everything runs on the local node, one agent per GPU.
+
+Before round 1, the harness measures the original model on agent0's first GPU with `gino_profile.py`. It records
 the parameter count and tensor shapes, the seconds per epoch with and without physics, the GPU
 memory, and the size of a dense N x N matrix. The harness then starts the unmodified Adam baseline
 (`agent0-run000`). Each round has these phases:
@@ -42,7 +49,7 @@ memory, and the size of a dense N x N matrix. The harness then starts the unmodi
 | propose | in parallel | Each agent proposes 1-3 optimizers with feasibility arithmetic: optimizer state against GPU memory, extra cost per step against the epoch time, full-batch or line-search needs, risk |
 | critique | in parallel | Each agent checks its peers' arithmetic, points out infeasible items or better variants (for example a limited-memory version), and ranks the directions |
 | claim | one at a time | Each agent claims one direction that no one else has claimed this round |
-| work | in parallel | Each agent implements its claim in its own workspace, smoke-tests it, trains it on its GPU, posts insights, and ends with a round report |
+| work | in parallel | Each agent implements its claim in its own workspace, smoke-tests it, trains it on its GPUs (several runs at once), posts insights, and ends with a round report |
 
 The final message of each phase is posted to the board. Each agent's conversation continues across
 phases and rounds, so in later rounds the agents build on the results and reports of earlier rounds.
@@ -53,10 +60,13 @@ phases and rounds, so in later rounds the agents build on the results and report
 | `Read`, `Glob`, `Grep` | all | Read the whole campaign (including peers' code) and the paper |
 | `Write`, `Edit` | work | Edit the agent's own workspace only. The agents have no shell. |
 | `smoke_test` | work | 3 epochs of the agent's `train.py`. It is free. |
-| `run_script` | work | Runs a script from the agent's workspace on its GPU, for example a toy-problem test of a new optimizer |
-| `launch_training` + `wait_for_job` | work | One full run with the shared fixed budget (`--fixed-args`, appended last). The agent gets `--runs-per-round` runs per round. |
+| `run_script` | work | Runs a script from the agent's workspace on a free GPU, for example a toy-problem test of a new optimizer |
+| `launch_training` + `wait_for_jobs` | work | Full runs with the shared fixed budget (`--fixed-args`, appended last), one per free GPU. `wait_for_jobs` returns each run as it finishes. The agent gets `--runs-per-round` runs per round. |
 
-The harness, not the agent, scores every full run. It runs a pristine copy of the original
+The harness, not the agent, scores every full run. The original `evaluate.py` rebuilds the model
+from the hyperparameters saved in the checkpoint, so runs that change the model size through existing
+`train.py` flags are scored correctly. Agents may not edit `model.py`, since its changes wouldn't be
+scored. Every result reports its parameter count. It runs a pristine copy of the original
 `evaluate.py` on `checkpoint_best.pt` for the held-out case (`--eval-re`, default Re180) and ranks
 the runs by the mean relative L2 error of u, v and p.
 
@@ -91,7 +101,7 @@ git, so copy them there. A missing paper is skipped with a warning.
 After a campaign, update `briefing.md` and copy its `board.jsonl` into `gino_prior/`, so the next
 campaign starts from what this one learned.
 
-### Run on one Polaris node (4 A100s, 4 agents)
+### Run on Polaris (5 nodes: 5 agents, 4 A100s each)
 
 `aifiv` is a git submodule. Clone with `git clone --recurse-submodules`, or run
 `git submodule update --init` in an existing clone. The paper PDF is not tracked in `aifiv`, so
@@ -131,23 +141,26 @@ The agents never load conda. Each training run goes through
 `scaling_agents/polaris_train_python.sh` (the default `TRAIN_PYTHON`), which loads the conda
 module and activates `aifiv_env` for that subprocess only. Set `AIFIV_ENV` to use a venv
 somewhere else. Before starting the agents, the job checks the training env: torch, PyG
-`radius` on a GPU, netCDF4, and 4 visible GPUs. A broken env fails in seconds, not in round 1.
+`radius` on a GPU, netCDF4, and 4 visible GPUs, on every node. A broken env fails in seconds, not
+in round 1.
 
 The case data `Re*/results/cylinder_2d_min.e` must be in `aifiv/2DLaminar` (or pass `--source`).
 Put your AMSC token in `aurora_env_setup.sh`. The agents use `claude-opus-5-5`, and fall back to
 `claude-sonnet-5-5` when Opus is overloaded. MAG serves both under the `google` provider header that
 `aurora_env_setup.sh` already sets. Override them with `GINO_LLM_MODEL` and
 `GINO_LLM_FALLBACK_MODEL`. These are separate from `LLM_MODEL`, which the Wordle examples use.
-Submit from the repo root:
+Submit from the repo root. The script asks for 5 nodes in `prod` (its minimum) for 8 hours:
 
 ```bash
 qsub -A <project> scaling_agents/polaris_gino_optimizer.pbs
 ```
 
+To change the number of agents, change `-l select`: there is always one agent per node.
+
 The script uses environment variables for the main settings:
 - `FIXED_ARGS`: default `--epochs 2000 --warmup-epochs 200 --ramp-epochs 800`.
 - `ROUNDS`: default 5.
-- `RUNS_PER_ROUND`: default 4.
+- `RUNS_PER_ROUND`: default 8, i.e. two waves of 4 parallel runs per agent.
 - `RUN_TIMEOUT_MIN`: default 25.
 - `WALLTIME_MIN`: default 480. Keep it equal to the `-l walltime` you request.
 - `PRIOR`: the prior-knowledge paths.
@@ -156,6 +169,5 @@ The script uses environment variables for the main settings:
 The agents see how much job time is left. Every run is cut 12 minutes before the walltime, so each
 agent can score its run and post a report. Launches are refused in the last minutes, and no new
 round starts with less than 40 minutes left. Within an 8-hour job, the round count adapts to how long
-each round takes. Each
-run is pinned to its GPU with `CUDA_VISIBLE_DEVICES` and to the 8 cores next to that GPU
-(`--cpu-bind polaris`). Check the core mapping with `nvidia-smi topo -m`.
+each round takes. Each run is pinned to its GPU with `CUDA_VISIBLE_DEVICES`, and to the 8 cores
+next to that GPU (`--cpu-bind polaris`), on its agent's node. Check the core mapping with `nvidia-smi topo -m`.

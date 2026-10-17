@@ -1,10 +1,15 @@
 #!/bin/bash -l
-# Four optimizer agents on one Polaris node, one A100 each (4_gino_optimizer_board.py):
-# per round they debate which optimizers are feasible, claim one each, train, and report back.
+# Optimizer agents for the GINO model on Polaris (4_gino_optimizer_board.py): one agent per node,
+# each running up to 4 trainings at once, one per A100. Per round they debate which optimizers are
+# feasible, claim one direction each, train, and report back.
 #
 # Submit from the repo root (the job cds to $PBS_O_WORKDIR):
 #   qsub -A <project> scaling_agents/polaris_gino_optimizer.pbs
-#   qsub -A <project> -v ROUNDS=4,RUNS_PER_ROUND=3 scaling_agents/polaris_gino_optimizer.pbs
+#   qsub -A <project> -v ROUNDS=4,RUNS_PER_ROUND=12 scaling_agents/polaris_gino_optimizer.pbs
+#
+# Nodes: agents = nodes. Change -l select to change both; prod needs at least 5 nodes. All agents
+# and their LLM calls run in one process on the first node; each agent's training jobs are started
+# on its own node with `mpiexec -n 1 --hosts <node>` (mpiexec is only the launcher, nothing uses MPI).
 #
 # Two environments: the agents run in this repo's uv .venv (VENV); training runs through
 # polaris_train_python.sh (TRAIN_PYTHON), which loads ALCF conda + aifiv/aifiv_env (AIFIV_ENV).
@@ -16,20 +21,20 @@
 #
 # Prior knowledge: scaling_agents/gino_prior (briefing, earlier boards, the Kestrel log) plus every
 # earlier campaign directory in runs/ (the agents may read their code). Set PRIOR to override.
-#
-# Or interactively: qsub -I -A <project> -q debug -l select=1 -l walltime=01:00:00 -l filesystems=home:eagle,
-# then run the commands below by hand.
 #PBS -N gino_optimizer
-#PBS -l select=1:system=polaris
+#PBS -l select=5:system=polaris
 #PBS -l place=scatter
 #PBS -l walltime=08:00:00
 #PBS -l filesystems=home:eagle
-#PBS -q preemptable
+#PBS -q prod
 #PBS -j oe
 
 set -euo pipefail
 cd "${PBS_O_WORKDIR:-$(dirname "$0")/..}"
 REPO=$(pwd)
+HOSTS=$(sort -u "$PBS_NODEFILE")
+NNODES=$(wc -l <<< "$HOSTS")
+echo "nodes ($NNODES): $(echo $HOSTS)"
 
 # Agents: the uv env (academy, claude-agent-sdk) and the LLM gateway + proxy settings.
 VENV=${VENV:-$REPO/.venv}
@@ -39,23 +44,25 @@ source "$REPO/aurora_env_setup.sh"
 
 # Training: ALCF conda torch + torch_geometric, loaded only in the training subprocesses.
 TRAIN_PYTHON=${TRAIN_PYTHON:-$REPO/scaling_agents/polaris_train_python.sh}
-# Fail in seconds, not in round 1, if the training env is broken.
-"$TRAIN_PYTHON" -c "
-import torch, numpy, scipy, yaml, netCDF4
+# Fail in seconds, not in round 1, if the training env is broken on any node.
+mpiexec -n "$NNODES" --ppn 1 "$TRAIN_PYTHON" -c "
+import socket, torch, numpy, scipy, yaml, netCDF4
 from torch_geometric.nn import radius
 assert torch.cuda.device_count() >= 4, torch.cuda.device_count()
 x = torch.rand(100, 2, device='cuda')
-print('training env OK:', torch.__version__, torch.version.cuda, torch.cuda.device_count(), 'GPUs', radius(x, x, 0.1).shape)
+print(socket.gethostname(), 'training env OK:', torch.__version__, torch.version.cuda,
+      torch.cuda.device_count(), 'GPUs', radius(x, x, 0.1).shape, flush=True)
 "
 
 nvidia-smi topo -m || true
 
 python scaling_agents/4_gino_optimizer_board.py \
+    --hosts $HOSTS \
     --gpus 0 1 2 3 \
     --train-python "$TRAIN_PYTHON" \
     --fixed-args "${FIXED_ARGS:---epochs 2000 --warmup-epochs 200 --ramp-epochs 800}" \
     --rounds "${ROUNDS:-5}" \
-    --runs-per-round "${RUNS_PER_ROUND:-4}" \
+    --runs-per-round "${RUNS_PER_ROUND:-8}" \
     --run-timeout-min "${RUN_TIMEOUT_MIN:-25}" \
     --walltime-min $(( ${WALLTIME_MIN:-480} - SECONDS / 60 )) \
     --prior ${PRIOR:-scaling_agents/gino_prior $(ls -d runs/gino_optimizer_* 2> /dev/null)} \

@@ -84,8 +84,12 @@ def snapshot_code(workspace: Path, dest: Path) -> None:
         shutil.copy2(path, target)
 
 
+PARAMS_RE = re.compile(r'\| parameters (\d+)')
+
+
 def parse_train_log(text: str) -> dict[str, Any]:
     rows = []
+    params = PARAMS_RE.search(text)
     for line in text.splitlines():
         m = EPOCH_RE.match(line)
         if m:
@@ -95,7 +99,7 @@ def parse_train_log(text: str) -> dict[str, Any]:
                 'physics': _float(m['physics']),
                 'val_data': _float(m['val']),
             })
-    summary: dict[str, Any] = {'logged_epochs': len(rows)}
+    summary: dict[str, Any] = {'logged_epochs': len(rows), 'parameters': int(params[1]) if params else None}
     if not rows:
         return summary
     finite = [r for r in rows if math.isfinite(r['val_data'])]
@@ -139,6 +143,7 @@ class GinoSetup:
     smoke_timeout_min: float = 10.0
     cpu_bind: str = 'polaris'
     deadline: float | None = None   # time.time() by which every job must have ended (job walltime)
+    launcher: str = 'local'         # local: subprocess here; mpiexec: on the agent's host (multi-node)
 
     @property
     def reference(self) -> Path:
@@ -180,7 +185,10 @@ class RunRecord:
     train: dict[str, Any] = field(default_factory=dict)
     score: dict[str, float] = field(default_factory=dict)
     error_tail: str = ''
+    host: str = ''
+    complete: bool = False   # training and scoring both done (status alone flips before scoring)
     posted: bool = False     # result already on the message board
+    delivered: bool = False  # result already returned to the agent by wait_for_jobs
 
     def brief(self) -> dict[str, Any]:
         """What gets posted on the board (no long curves)."""
@@ -188,6 +196,7 @@ class RunRecord:
             'run_id': self.run_id, 'agent': self.agent, 'kind': self.kind,
             'status': self.status, 'extra_args': self.extra_args, 'notes': self.notes,
             'wall_minutes': round(self.wall_minutes, 1),
+            'parameters': self.train.get('parameters'),
             'test_rel_l2': self.score,
             'best_val_data': self.train.get('best_val_data'),
             'best_epoch': self.train.get('best_epoch'),
@@ -198,12 +207,13 @@ class RunRecord:
 
 
 class GpuRunner:
-    """Runs one subprocess at a time on one GPU for one agent."""
+    """Runs one subprocess at a time on one GPU (of ``host``, with the mpiexec launcher) for one agent."""
 
-    def __init__(self, setup: GinoSetup, agent: str, gpu: int, workspace: Path) -> None:
+    def __init__(self, setup: GinoSetup, agent: str, gpu: int, workspace: Path, host: str = '') -> None:
         self.setup = setup
         self.agent = agent
         self.gpu = gpu
+        self.host = host
         self.workspace = workspace
         self.records: list[RunRecord] = []
         self._task: asyncio.Task[RunRecord] | None = None
@@ -225,12 +235,25 @@ class GpuRunner:
             return ['taskset', '-c', f'{first}-{first + 7}']
         return []
 
+    def _command(self, cmd: list[str], cwd: Path) -> list[str]:
+        if self.setup.launcher != 'mpiexec':
+            return [*self._prefix(), *cmd]
+        # One rank on the agent's host. The GPU, threads and cwd are set on the remote side
+        # explicitly, so nothing depends on how mpiexec forwards the environment.
+        return [
+            'mpiexec', '-n', '1', '--ppn', '1', '--hosts', self.host, '--cpu-bind', 'none',
+            'env', f'CUDA_VISIBLE_DEVICES={self.gpu}', f'OMP_NUM_THREADS={os.environ.get("OMP_NUM_THREADS", "8")}',
+            'PYTHONUNBUFFERED=1', *self._prefix(),
+            'bash', '-c', 'cd "$0" && exec "$@"', str(cwd), *cmd,
+        ]
+
     async def _run(self, cmd: list[str], log_path: Path, cwd: Path, timeout_min: float) -> tuple[int | None, bool]:
+        full = self._command(cmd, cwd)
         with log_path.open('w') as log:
-            log.write('$ ' + shlex.join(cmd) + '\n')
+            log.write('$ ' + shlex.join(full) + '\n')
             log.flush()
             self._proc = await asyncio.create_subprocess_exec(
-                *self._prefix(), *cmd, cwd=cwd, env=self._env(),
+                *full, cwd=cwd, env=self._env(),
                 stdout=log, stderr=asyncio.subprocess.STDOUT, start_new_session=True,
             )
             try:
@@ -258,13 +281,15 @@ class GpuRunner:
     def busy(self) -> bool:
         return self._task is not None and not self._task.done()
 
-    def launch(self, kind: str, extra_args: list[str], notes: str, script: str | None = None) -> RunRecord:
+    def launch(
+        self, kind: str, extra_args: list[str], notes: str, script: str | None = None, run_id: str | None = None,
+    ) -> RunRecord:
         if self.busy:
             raise RuntimeError(f'GPU {self.gpu} is busy with {self.records[-1].run_id}; wait for it first')
-        run_id = f'{self.agent}-run{len(self.records):03d}'
+        run_id = run_id or f'{self.agent}-run{len(self.records):03d}'
         run_dir = self.workspace / 'runs' / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
-        record = RunRecord(run_id, self.agent, kind, self.gpu, list(extra_args), notes, str(run_dir))
+        record = RunRecord(run_id, self.agent, kind, self.gpu, list(extra_args), notes, str(run_dir), host=self.host)
         self.records.append(record)
         self._task = asyncio.create_task(self._execute(record, script))
         return record
@@ -308,6 +333,7 @@ class GpuRunner:
             record.error_tail = f'harness error: {exc!r}\n{record.error_tail}'
         finally:
             record.wall_minutes = (time.time() - record.started) / 60.0
+            record.complete = True
             (run_dir / 'result.json').write_text(json.dumps(asdict(record), indent=2, default=str))
         return record
 
@@ -365,3 +391,67 @@ class GpuRunner:
             os.killpg(self._proc.pid, signal.SIGTERM)
         if self._task is not None:
             await asyncio.gather(self._task, return_exceptions=True)
+
+
+class NodeRunner:
+    """An agent's GPUs: up to one job per GPU at a time, launched on the first idle one."""
+
+    def __init__(self, setup: GinoSetup, agent: str, gpus: list[int], workspace: Path, host: str = '') -> None:
+        self.slots = [GpuRunner(setup, agent, gpu, workspace, host) for gpu in gpus]
+        self.agent = agent
+        self.host = host
+        self.records: list[RunRecord] = []
+        self._tasks: dict[str, asyncio.Task[RunRecord]] = {}
+
+    @property
+    def busy(self) -> bool:
+        return any(slot.busy for slot in self.slots)
+
+    @property
+    def free(self) -> int:
+        return sum(not slot.busy for slot in self.slots)
+
+    def running(self) -> list[RunRecord]:
+        return [r for r in self.records if not r.complete]
+
+    def launch(self, kind: str, extra_args: list[str], notes: str, script: str | None = None) -> RunRecord:
+        slot = next((s for s in self.slots if not s.busy), None)
+        if slot is None:
+            ids = ', '.join(r.run_id for r in self.running())
+            raise RuntimeError(f'all {len(self.slots)} GPUs are busy ({ids}); wait for a job to finish first')
+        record = slot.launch(kind, extra_args, notes, script, run_id=f'{self.agent}-run{len(self.records):03d}')
+        self.records.append(record)
+        self._tasks[record.run_id] = slot._task
+        return record
+
+    async def wait(self, max_minutes: float) -> list[RunRecord]:
+        """Finished jobs not yet returned; if there are none, wait up to max_minutes for one to finish."""
+        pending = [t for t in self._tasks.values() if not t.done()]
+        if pending and not self._undelivered():
+            await asyncio.wait([asyncio.shield(t) for t in pending], timeout=max_minutes * 60.0,
+                               return_when=asyncio.FIRST_COMPLETED)
+        done = self._undelivered()
+        for record in done:
+            record.delivered = True
+        return done
+
+    def _undelivered(self) -> list[RunRecord]:
+        return [r for r in self.records if r.complete and not r.delivered]
+
+    async def wait_all(self, max_minutes: float) -> None:
+        pending = [t for t in self._tasks.values() if not t.done()]
+        if pending:
+            await asyncio.wait([asyncio.shield(t) for t in pending], timeout=max_minutes * 60.0)
+
+    def progress(self) -> list[dict[str, Any]]:
+        out = []
+        for slot in self.slots:
+            if slot.busy:
+                out.append({**slot.progress(), 'gpu': slot.gpu})
+        return out
+
+    async def profile(self) -> dict[str, Any]:
+        return await self.slots[0].profile()
+
+    async def stop(self) -> None:
+        await asyncio.gather(*(slot.stop() for slot in self.slots))

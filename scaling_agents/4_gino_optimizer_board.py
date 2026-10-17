@@ -1,8 +1,8 @@
 """Peer agents that debate, implement and test optimizers for the 2DLaminar GINO model.
 
 This is `2_message_board.py` with the Wordle game replaced by an expensive simulation:
-training the GINO surrogate in `aifiv/2DLaminar/gino`. One agent per GPU (4 on a Polaris
-node). Before the first round the harness profiles the model (parameter count and shapes,
+training the GINO surrogate in `aifiv/2DLaminar/gino`. One agent per node (or per GPU on a
+single node). Before the first round the harness profiles the model (parameter count and shapes,
 seconds per epoch, GPU memory) and starts the unmodified Adam baseline. Then, every round:
 
   1. propose   each agent proposes optimizers worth trying (from the paper in aifiv/ or
@@ -11,17 +11,20 @@ seconds per epoch, GPU memory) and starts the unmodified Adam baseline. Then, ev
   2. critique  each agent checks its peers' proposals and arithmetic and ranks directions;
   3. claim     agents claim one direction each, in order, so no two take the same one;
   4. work      each agent implements its claim in its own copy of the code, smoke-tests it,
-               trains it on its GPU, posts insights, and ends with a round report.
+               trains it on its GPUs (several runs at once), posts insights, and ends with a round report.
 
 Every post goes on a shared message board, and every agent keeps its conversation across
 phases and rounds. Each finished run is scored by a pristine copy of the original
 `evaluate.py` on the held-out Reynolds number (relative L2 error of u, v, p), so all agents
 are ranked on the same metric.
 
-Example (one Polaris node, see polaris_gino_optimizer.pbs)::
+Placement: with `--hosts`, one agent per host, and each agent runs up to one job per GPU of its host
+(launched there with mpiexec). Without hosts, everything runs on this node, one agent per GPU.
 
-    python 4_gino_optimizer_board.py --gpus 0 1 2 3 --rounds 3 --runs-per-round 2 \\
-        --train-python /path/to/conda/envs/aifiv/bin/python \\
+Example (5 Polaris nodes: 5 agents x 4 GPUs, see polaris_gino_optimizer.pbs)::
+
+    python 4_gino_optimizer_board.py --hosts $(sort -u $PBS_NODEFILE) --gpus 0 1 2 3 \\
+        --train-python scaling_agents/polaris_train_python.sh \\
         --fixed-args "--epochs 2000 --warmup-epochs 200 --ramp-epochs 800"
 """
 
@@ -56,7 +59,7 @@ from claude_agent_sdk import ResultMessage
 from claude_agent_sdk import tool
 
 from gino_runner import GinoSetup
-from gino_runner import GpuRunner
+from gino_runner import NodeRunner
 
 logger = logging.getLogger(__name__)
 
@@ -108,8 +111,8 @@ team's ranking. State exactly what you will implement, the files and flags you w
 {runs} full runs you plan. Keep it under 150 words. Your final message is posted as your claim.""",
     'work': """ROUND {round} WORK. ({clock})
 Carry out your claim: implement it in your workspace, check it with `smoke_test` (and `run_script`
-for standalone tests), then use your {runs} full runs (launch_training, then wait_for_job until it
-finishes). Post insights with write_board as you learn things. If the claim turns out infeasible
+for standalone tests), then use your {runs} full runs: launch several at once on your free GPUs
+(launch_training), then call wait_for_jobs as they finish. Post insights with write_board as you learn things. If the claim turns out infeasible
 or broken, post an insight saying why and switch to the next-best unclaimed direction.
 Runs are cut at the job deadline, and launches are refused in its last minutes, so leave time to
 finish and report.
@@ -176,8 +179,8 @@ class OptimizerAgent(Agent):
 
     Args:
         peers: Handles of all agents (itself included; removed on startup).
-        index: This agent's index; also picks its GPU from ``gpus``.
-        gpus: GPU ids, one per agent.
+        index: This agent's index; also picks its host and GPUs from ``placement``.
+        placement: Per agent, the host its jobs run on ('' = this node) and its GPU ids.
         setup: Shared paths, training budget and scoring case.
         knowledge: Papers (text or PDF paths), prior-campaign paths the agent may read, the
             briefing text, and prior full-run results (board posts) for the leaderboard.
@@ -188,7 +191,7 @@ class OptimizerAgent(Agent):
         self,
         peers: list[Handle[OptimizerAgent]],
         index: int,
-        gpus: list[int],
+        placement: list[tuple[str, list[int]]],
         setup: GinoSetup,
         knowledge: dict[str, Any],
         runs_per_round: int,
@@ -197,15 +200,15 @@ class OptimizerAgent(Agent):
         self.peers = peers
         self.index = index
         self.name = f'agent{index}'
-        self.gpu = gpus[index]
-        self.num_agents = len(gpus)
+        self.host, self.gpus = placement[index]
+        self.num_agents = len(placement)
         self.setup = setup
         self.papers: list[Path] = knowledge['papers']
         self.prior_paths: list[Path] = knowledge['prior_paths']
         self.briefing: str = knowledge['briefing']
         self.runs_per_round = runs_per_round
         self.workspace = setup.campaign / self.name
-        self.runner = GpuRunner(setup, self.name, self.gpu, self.workspace)
+        self.runner = NodeRunner(setup, self.name, self.gpus, self.workspace, self.host)
         self.posts: list[dict[str, Any]] = list(knowledge['prior_results'])
         self.facts: dict[str, Any] = {}
         self.round = 0
@@ -244,7 +247,7 @@ class OptimizerAgent(Agent):
     async def _post_finished(self) -> None:
         """Post every finished training run that is not on the board yet."""
         for record in self.runner.records:
-            if record.status != 'running' and not record.posted and record.kind != 'script':
+            if record.complete and not record.posted and record.kind != 'script':
                 record.posted = True
                 await self._publish({'kind': 'result', 'result': record.brief()})
 
@@ -312,8 +315,9 @@ class OptimizerAgent(Agent):
         setup = self.setup
         papers = '\n'.join(f'- {p}' for p in self.papers) or '- (none found)'
         priors = '\n'.join(f'- {p}' for p in self.prior_paths) or '- (none)'
-        return f"""You are {self.name}, one of {self.num_agents} peer research agents on one GPU node, each with
-its own GPU (yours is GPU {self.gpu}). Together you are improving the OPTIMIZER used to train a GINO
+        where = f'node {self.host}' if self.host else 'this node'
+        return f"""You are {self.name}, one of {self.num_agents} peer research agents. Each agent has its own GPU
+node, and yours is {where} with {len(self.gpus)} GPU(s): {self.gpus}. Together you are improving the OPTIMIZER used to train a GINO
 (graph-informed neural operator: GNO encoder, FNO on overset latent grids, GNO decoder) surrogate for
 2D laminar flow past a cylinder over a Reynolds-number sweep, trained full-batch on CFD data plus a
 physics-residual loss.
@@ -344,18 +348,27 @@ Your workspace (edit freely during the work phase): {self.workspace / 'gino'} (t
 ...); the data stays in {setup.source}. You may read, not edit, peers' workspaces under
 {setup.campaign} to reuse code that works.
 Rules:
-- Change only the optimization: optimizer, its hyperparameters, LR schedule, phase switching
+- Change the optimization freely: optimizer, its hyperparameters, LR schedule, phase switching
   (e.g. Adam then L-BFGS), and the physics/data loss balancing if you argue it is part of the
-  optimizer. Do NOT change the model architecture, inputs, data or checkpoint format: the harness
-  scores checkpoint_best.pt with the ORIGINAL evaluate.py on Re{setup.eval_re}.
+  optimizer.
+- You may also change the model SIZE, but only through train.py's existing architecture flags:
+  --latent-channels (default 32), --num-fno-layers (4), --polar-fno-modes / --cartesian-fno-modes
+  (16 16), --polar-grid / --cartesian-grid, and the GNO radius scales. The user suspects 32 FNO
+  channels may be more than this problem needs. A smaller model also changes what is feasible:
+  MODEL FACTS are for the default size, and every result reports its own `parameters`. Do NOT
+  edit model.py, the inputs, the data or the checkpoint format. The harness scores
+  checkpoint_best.pt with the ORIGINAL evaluate.py on Re{setup.eval_re}, which rebuilds the model
+  from the checkpoint's saved train.py arguments, so only existing flags are scored correctly.
 - Every full run uses the same fixed budget, appended last to your args:
   {shlex.join(setup.fixed_args)}
   and is killed after {setup.run_timeout_min:g} minutes. Wall-clock time matters too.
 - You get {self.runs_per_round} full runs per round. `smoke_test` (3 epochs) is free; use it after every
   code change, and `run_script` for standalone checks (e.g. an optimizer on a toy problem).
-- Only one job runs on your GPU at a time: launch, then call `wait_for_job` until it finishes.
-- The unmodified Adam baseline is run by the harness as agent0-run000 (on agent0's GPU); compare
-  against it.
+- Up to {len(self.gpus)} jobs run at once, one per GPU: launch several (e.g. an LR sweep), then call
+  `wait_for_jobs`, which returns each job as it finishes. Each job runs the workspace code as it was
+  at launch, so finish editing before launching the jobs that should use it.
+- The unmodified Adam baseline is run by the harness as agent0-run000 (on one of agent0's GPUs);
+  compare against it.
 Results of every run are posted to the board automatically."""
 
     def _tools(self) -> list[Any]:
@@ -383,15 +396,16 @@ Results of every run are posted to the board automatically."""
                 record = runner.launch(kind, shlex.split(args.get('extra_args') or args.get('args') or ''),
                                        args.get('notes', ''), script=script)
             except (RuntimeError, ValueError) as exc:
-                return text_result(f'{exc}. Call wait_for_job first.')
+                return text_result(f'{exc}. Call wait_for_jobs first.')
             if kind == 'full':
                 self.runs_left -= 1
-            return text_result({'run_id': record.run_id, 'run_dir': record.run_dir,
-                                'full_runs_left_this_round': self.runs_left, 'next': 'call wait_for_job'})
+            return text_result({'run_id': record.run_id, 'gpu': record.gpu, 'run_dir': record.run_dir,
+                                'full_runs_left_this_round': self.runs_left, 'free_gpus': runner.free,
+                                'next': 'launch more on free GPUs, or call wait_for_jobs'})
 
         @tool(
             'launch_training',
-            'Launch a FULL training run of your workspace train.py on your GPU with the fixed budget. '
+            'Launch a FULL training run of your workspace train.py on a free GPU with the fixed budget. '
             'extra_args: train.py flags as one shell string (e.g. "--lr 3e-3 --lbfgs-blocks 50", or flags '
             'you added). notes: what this run tests and why.',
             {'extra_args': str, 'notes': str},
@@ -410,7 +424,7 @@ Results of every run are posted to the board automatically."""
 
         @tool(
             'run_script',
-            'Run a Python script from your workspace on your GPU (training env, cwd = your gino dir, '
+            'Run a Python script from your workspace on a free GPU (training env, cwd = your gino dir, '
             '10 min limit), e.g. a unit test of a new optimizer. path: script path inside your workspace. '
             'args: optional command-line arguments as one shell string.',
             {'path': str, 'args': str},
@@ -425,26 +439,30 @@ Results of every run are posted to the board automatically."""
             return await launch('script', {'args': args.get('args', '')}, script=str(path))
 
         @tool(
-            'wait_for_job',
-            'Wait up to max_minutes (<= 15) for the job on your GPU. Returns the result when it finishes '
-            '(scores, learning curve, error tail), else its progress.',
+            'wait_for_jobs',
+            'Wait up to max_minutes (<= 15) until at least one of your jobs finishes. Returns every job '
+            'that finished since the last call (scores, learning curve, error tail), and the progress of '
+            'the ones still running.',
             {'max_minutes': float},
         )
-        async def wait_for_job(args: dict[str, Any]) -> dict[str, Any]:
+        async def wait_for_jobs(args: dict[str, Any]) -> dict[str, Any]:
             if not runner.records:
                 return text_result('No job has been launched.')
             minutes = min(max(float(args.get('max_minutes', 10)), 0.1), 15.0)
-            record = await runner.wait(minutes)
-            if record is None:
-                return text_result(runner.progress() if runner.busy else 'No job is running.')
-            if record.kind == 'script':
-                return text_result({'run_id': record.run_id, 'status': record.status,
-                                    'returncode': record.returncode, 'output_tail': record.error_tail})
+            finished = await runner.wait(minutes)
             await self._post_finished()
-            return text_result({**record.brief(), 'curve': record.train.get('curve'),
+            out = []
+            for record in finished:
+                if record.kind == 'script':
+                    out.append({'run_id': record.run_id, 'kind': 'script', 'status': record.status,
+                                'returncode': record.returncode, 'output_tail': record.error_tail})
+                else:
+                    out.append({**record.brief(), 'curve': record.train.get('curve'),
                                 'error_tail': record.error_tail})
+            return text_result({'finished': out, 'running': runner.progress(), 'free_gpus': runner.free,
+                                'full_runs_left_this_round': self.runs_left})
 
-        return [read_board, write_board, launch_training, smoke_test, run_script, wait_for_job]
+        return [read_board, write_board, launch_training, smoke_test, run_script, wait_for_jobs]
 
     def _clock(self) -> str:
         left = self.setup.minutes_left()
@@ -494,7 +512,7 @@ Results of every run are posted to the board automatically."""
         record = self.runner.launch('full', [], 'harness: unmodified Adam baseline (original train.py defaults)')
 
         async def post_when_done() -> None:
-            await self.runner.wait(self.setup.run_timeout_min + 30)
+            await self.runner._tasks[record.run_id]
             await self._post_finished()
 
         task = asyncio.create_task(post_when_done())
@@ -521,9 +539,9 @@ Results of every run are posted to the board automatically."""
         text = await self._converse(
             STEP_PROMPTS['work'].format(round=round_, runs=self.runs_per_round, clock=self._clock()), max_turns=300,
         )
-        if self.runner.busy and self.runner.records[-1].kind == 'full':
-            # The conversation ended with a run still going: let it finish so the next round sees it.
-            await self.runner.wait(self.setup.run_timeout_min + 30)
+        if any(r.kind == 'full' for r in self.runner.running()):
+            # The conversation ended with runs still going: let them finish so the next round sees them.
+            await self.runner.wait_all(self.setup.run_timeout_min + 30)
         await self._post_finished()
         await self._publish({'kind': 'report', 'text': text})
         self.phase = 'idle'
@@ -532,7 +550,13 @@ Results of every run are posted to the board automatically."""
 
 def parse_cli() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--gpus', type=int, nargs='+', default=[0, 1, 2, 3], help='One agent per GPU')
+    parser.add_argument('--hosts', nargs='*', default=[],
+                        help='One agent per host; its jobs run there through mpiexec (e.g. the unique hosts of '
+                             '$PBS_NODEFILE). Without hosts, everything runs on this node')
+    parser.add_argument('--gpus', type=int, nargs='+', default=[0, 1, 2, 3], help='GPU ids on each node')
+    parser.add_argument('--gpus-per-agent', type=int, default=None,
+                        help='GPUs each agent runs jobs on at once (default: all of a host\'s GPUs with --hosts, '
+                             'else 1, i.e. one agent per GPU of this node)')
     parser.add_argument('--source', type=Path, default=REPO / 'aifiv' / '2DLaminar',
                         help='Directory with gino/, pino_physics_loss.py and the Re* case data')
     parser.add_argument('--paper', type=Path, nargs='+', default=[
@@ -564,6 +588,15 @@ def parse_cli() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def agent_placement(hosts: list[str], gpus: list[int], per_agent: int | None) -> list[tuple[str, list[int]]]:
+    """(host, GPU ids) per agent: each host's GPUs split into groups of per_agent."""
+    per_agent = per_agent or (len(gpus) if hosts else 1)
+    if per_agent < 1 or len(gpus) % per_agent:
+        raise ValueError(f'--gpus-per-agent {per_agent} must divide the {len(gpus)} GPUs per node')
+    groups = [gpus[i:i + per_agent] for i in range(0, len(gpus), per_agent)]
+    return [(host, group) for host in (hosts or ['']) for group in groups]
+
+
 def write_leaderboard(campaign: Path, name: str) -> list[dict[str, Any]]:
     results = [json.loads(p.read_text()) for p in sorted(campaign.glob('agent*/runs/*/result.json'))]
     results = [r for r in results if r['kind'] == 'full']
@@ -593,9 +626,11 @@ async def main() -> None:
         eval_re=cli.eval_re,
         run_timeout_min=cli.run_timeout_min,
         cpu_bind=cli.cpu_bind,
+        launcher='mpiexec' if cli.hosts else 'local',
         deadline=None if cli.walltime_min is None else start + 60.0 * (cli.walltime_min - cli.end_margin_min),
     )
-    setup.prepare(len(cli.gpus))
+    placement = agent_placement(cli.hosts, cli.gpus, cli.gpus_per_agent)
+    setup.prepare(len(placement))
     papers = [
         extract_paper(pdf.resolve(), campaign / 'reference' / f'{pdf.stem}.txt') for pdf in cli.paper
     ]
@@ -609,7 +644,7 @@ async def main() -> None:
         'briefing': briefing,
         'prior_results': load_prior_results(prior_paths),
     }
-    logger.info(f'Campaign {campaign}: {len(cli.gpus)} agents on GPUs {cli.gpus}, {cli.rounds} rounds, '
+    logger.info(f'Campaign {campaign}: {len(placement)} agents, placement {placement}, {cli.rounds} rounds, '
                 f'model {MODEL} (fallback {FALLBACK_MODEL or "none"}), {len(knowledge["papers"])} papers, '
                 f'{len(knowledge["prior_results"])} prior runs, {setup.minutes_left():.0f} min of job time')
 
@@ -618,19 +653,19 @@ async def main() -> None:
         log_config=recommended_logging(),
     ) as manager:
         registrations: list[AgentRegistrationT] = [
-            await manager.register_agent(OptimizerAgent) for _ in cli.gpus
+            await manager.register_agent(OptimizerAgent) for _ in placement
         ]
         peers = [Handle(reg.agent_id) for reg in registrations]
         handles = [
             await manager.launch(
                 OptimizerAgent,
-                args=(peers, i, cli.gpus, setup, knowledge, cli.runs_per_round),
+                args=(peers, i, placement, setup, knowledge, cli.runs_per_round),
                 registration=reg,
             )
             for i, reg in enumerate(registrations)
         ]
 
-        logger.info('Profiling the original model on the first GPU.')
+        logger.info("Profiling the original model on agent0's first GPU.")
         facts = await handles[0].profile()
         logger.info(f'Model facts: {json.dumps(facts)}')
         await asyncio.gather(*(h.set_facts(facts) for h in handles))
