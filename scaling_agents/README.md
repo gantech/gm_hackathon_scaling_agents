@@ -113,7 +113,11 @@ somewhere else. Before starting the agents, the job checks the training env: tor
 `radius` on a GPU, netCDF4, and 4 visible GPUs. A broken env fails in seconds, not in round 1.
 
 The case data `Re*/results/cylinder_2d_min.e` must be in `aifiv/2DLaminar` (or pass `--source`).
-Put your AMSC token in `aurora_env_setup.sh`. Submit from the repo root:
+Put your AMSC token in `aurora_env_setup.sh`. The agents use `claude-opus-5-5`, and fall back to
+`claude-sonnet-5-5` when Opus is overloaded. MAG serves both under the `google` provider header that
+`aurora_env_setup.sh` already sets. Override them with `GINO_LLM_MODEL` and
+`GINO_LLM_FALLBACK_MODEL`. These are separate from `LLM_MODEL`, which the Wordle examples use.
+Submit from the repo root:
 
 ```bash
 qsub -A <project> scaling_agents/polaris_gino_optimizer.pbs

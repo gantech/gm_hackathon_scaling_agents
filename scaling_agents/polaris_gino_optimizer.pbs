@@ -8,6 +8,8 @@
 #
 # Two environments: the agents run in this repo's uv .venv (VENV); training runs through
 # polaris_train_python.sh (TRAIN_PYTHON), which loads ALCF conda + aifiv/aifiv_env (AIFIV_ENV).
+# The agents use GINO_LLM_MODEL (default claude-opus-5-5), falling back to GINO_LLM_FALLBACK_MODEL
+# (default claude-sonnet-5-5) when it is overloaded.
 #
 # Walltime: about ROUNDS x RUNS_PER_ROUND x RUN_TIMEOUT_MIN plus debate time (3 x 2 x 60 min + ~1 h).
 #

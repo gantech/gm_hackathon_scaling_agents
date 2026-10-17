@@ -63,6 +63,18 @@ REPO = Path(__file__).resolve().parent.parent
 FILE_TOOLS = ['Read', 'Write', 'Edit', 'Glob', 'Grep']
 WRITE_TOOLS = {'Write', 'Edit'}
 DEBATE_STEPS = ('propose', 'critique', 'claim')
+# Own variables, so LLM_MODEL in aurora_env_setup.sh can stay on the Wordle examples' model.
+# MAG serves Claude models under its "google" provider too, so the shared header still works.
+MODEL = os.environ.get('GINO_LLM_MODEL', 'claude-opus-5-5')
+FALLBACK_MODEL = os.environ.get('GINO_LLM_FALLBACK_MODEL', 'claude-sonnet-5-5')  # used when MODEL is overloaded
+# Claude Code settings MAG recommends; no background calls (session titles) to other models.
+CLI_ENV = {
+    'DISABLE_NON_ESSENTIAL_MODEL_CALLS': '1',
+    'DISABLE_TELEMETRY': '1',
+    'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS': '1',
+    'CLAUDE_CODE_MAX_OUTPUT_TOKENS': '16384',
+    'MCP_TOOL_TIMEOUT': str(20 * 60 * 1000),
+}
 
 STEP_PROMPTS = {
     'propose': """ROUND {round} DEBATE, step 1 of 3: PROPOSE.
@@ -139,7 +151,7 @@ class OptimizerAgent(Agent):
         paper: Path,
         runs_per_round: int,
     ) -> None:
-        self.model = os.environ.get('LLM_MODEL', 'claude-haiku-5-5')
+        self.model = MODEL
         self.peers = peers
         self.index = index
         self.name = f'agent{index}'
@@ -379,6 +391,7 @@ Results of every run are posted to the board automatically."""
         tools = self._tools()
         options = ClaudeAgentOptions(
             model=self.model,
+            fallback_model=FALLBACK_MODEL if FALLBACK_MODEL and FALLBACK_MODEL != self.model else None,
             system_prompt=self._system_prompt(),
             cwd=str(self.workspace / 'gino'),
             mcp_servers={'gino': create_sdk_mcp_server('gino', tools=tools)},
@@ -388,7 +401,7 @@ Results of every run are posted to the board automatically."""
             allowed_tools=[f'mcp__gino__{t.name}' for t in tools],
             can_use_tool=self.can_use_tool,
             setting_sources=[],
-            env={'MCP_TOOL_TIMEOUT': str(20 * 60 * 1000)},
+            env=CLI_ENV,
             max_turns=max_turns,
             resume=self.session_id,
         )
@@ -506,7 +519,8 @@ async def main() -> None:
     )
     setup.prepare(len(cli.gpus))
     paper = extract_paper(cli.paper.resolve(), campaign / 'reference' / 'paper.txt')
-    logger.info(f'Campaign {campaign}: {len(cli.gpus)} agents on GPUs {cli.gpus}, {cli.rounds} rounds')
+    logger.info(f'Campaign {campaign}: {len(cli.gpus)} agents on GPUs {cli.gpus}, {cli.rounds} rounds, '
+                f'model {MODEL} (fallback {FALLBACK_MODEL or "none"})')
 
     async with await Manager.from_exchange_factory(
         factory=LocalExchangeFactory(),
