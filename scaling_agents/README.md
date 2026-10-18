@@ -101,6 +101,23 @@ git, so copy them there. A missing paper is skipped with a warning.
 After a campaign, update `briefing.md` and copy its `board.jsonl` into `gino_prior/`, so the next
 campaign starts from what this one learned.
 
+### Check MAG access from a new machine
+
+Before running the agents on a new cluster, check that it can reach MAG and run one agent through it.
+`kestrel_env_setup.sh` has the MAG settings without ALCF's proxies; put your token in it. Then, in this
+repo's uv env:
+
+```bash
+source kestrel_env_setup.sh && python scaling_agents/check_mag_agent.py
+```
+
+It prints PASS or FAIL for each step:
+1. The MAG settings are set.
+2. MAG lists its models, including the Claude names it serves.
+3. A direct request to `GINO_LLM_MODEL` (default `claude-opus-5-5`) succeeds. A wrong token, model name
+   or provider fails here within seconds, with MAG's own error message.
+4. One Academy agent completes a Claude Agent SDK query through MAG, including a tool call.
+
 ### Run on Polaris (5 nodes: 5 agents, 4 A100s each)
 
 `aifiv` is a git submodule. Clone with `git clone --recurse-submodules`, or run
